@@ -333,13 +333,18 @@ def run_tests_on_code(solution_code: str, tests_code: str, timeout_sec: int = 25
     with open(tst_path, "w", encoding="utf-8") as f:
         f.write(tests_code)
 
-    cmd = [sys.executable, "-X", "faulthandler", tst_path]
     env = os.environ.copy()
     env["PYTHONPATH"] = td + os.pathsep + env.get("PYTHONPATH", "")
 
+    # First try running tests via pytest so that any test functions are actually
+    # executed.  If pytest is missing or collects no tests, fall back to running
+    # the test file directly as a script.
+    cmd_pytest = [sys.executable, "-X", "faulthandler", "-m", "pytest", tst_path]
+    cmd_script = [sys.executable, "-X", "faulthandler", tst_path]
+
     try:
         proc = subprocess.run(
-            cmd,
+            cmd_pytest,
             cwd=td,
             env=env,
             stdout=subprocess.PIPE,
@@ -347,6 +352,20 @@ def run_tests_on_code(solution_code: str, tests_code: str, timeout_sec: int = 25
             timeout=timeout_sec,
             text=True,
         )
+
+        # pytest exits with code 5 when no tests are collected. Also handle the
+        # case where pytest isn't installed.
+        if proc.returncode == 5 or "No module named pytest" in proc.stderr:
+            proc = subprocess.run(
+                cmd_script,
+                cwd=td,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout_sec,
+                text=True,
+            )
+
         return TestResult(
             passed=(proc.returncode == 0),
             stdout=proc.stdout,
