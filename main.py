@@ -14,7 +14,7 @@ from groq import Groq
 import requests
 
 ###############################################################################
-# Configuration (2025-08 snapshot)
+# Configuration (2025-08 snapshot) — user-preferred families prioritized
 ###############################################################################
 DEFAULT_MODELS = "auto"
 
@@ -24,44 +24,54 @@ PRODUCTION_MODELS = [
     "meta-llama/llama-guard-4-12b",
 ]
 
+# Includes the models you asked to prioritize: DeepSeek R1 Distill, Qwen 3, Llama 4 Maverick, Kimi K2
 PREVIEW_MODELS = [
     "deepseek-r1-distill-llama-70b",
-    "mixtral-8x7b-32768",
     "qwen/qwen3-32b",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "moonshotai/kimi-k2-instruct",
+    "mixtral-8x7b-32768",
     "llama3-8b-8192",
     "llama3-70b-8192",
     "llama2-70b-4096",
     "gemma-7b-it",
     "llama3-groq-70b-8192-tool-use-preview",
     "llama3-groq-8b-8192-tool-use-preview",
-    "meta-llama/llama-4-maverick-17b-128e-instruct",
     "meta-llama/llama-4-scout-17b-16e-instruct",
     "meta-llama/llama-prompt-guard-2-22m",
     "meta-llama/llama-prompt-guard-2-86m",
-    "moonshotai/kimi-k2-instruct",
     "playai-tts",
     "playai-tts-arabic",
+    "moonshotai/kimi-k2-instruct",  # (already listed above; kept here in case of set ops)
 ]
 
+# === Preference order updates ===
+# Fan-out now prefers: DeepSeek R1 Distill → Qwen 3 → Llama 4 Maverick → Kimi K2, then others.
 FANOUT_PREFERENCE = [
+    "deepseek-r1-distill-llama-70b",
+    "qwen/qwen3-32b",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "moonshotai/kimi-k2-instruct",
     "llama-3.1-8b-instant",
     "mixtral-8x7b-32768",
-    "qwen/qwen3-32b",
+    "llama-3.3-70b-versatile",
     "llama3-8b-8192",
-    "llama-3.3-70b-versatile",
     "llama3-70b-8192",
-    "deepseek-r1-distill-llama-70b",
 ]
 
+# Synthesis/repair now prefers: DeepSeek R1 Distill → Qwen 3 → Llama 4 Maverick → Kimi K2, then others.
 SYNTH_PREFERENCE = [
-    "llama-3.3-70b-versatile",
     "deepseek-r1-distill-llama-70b",
+    "qwen/qwen3-32b",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "moonshotai/kimi-k2-instruct",
+    "llama-3.3-70b-versatile",
     "llama3-70b-8192",
     "mixtral-8x7b-32768",
-    "qwen/qwen3-32b",
     "llama-3.1-8b-instant",
 ]
 
+# Tool-use models (kept for routing when you pass --prefer-tool-use or your task hints at tools/JSON)
 TOOL_USE_PREFERENCE = [
     "llama3-groq-70b-8192-tool-use-preview",
     "llama3-groq-8b-8192-tool-use-preview",
@@ -95,6 +105,26 @@ Your job: Return a corrected, complete Python module that passes the tests.
 """
 
 CODE_BLOCK_RE = re.compile(r"```(?:python)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+
+# Post-pass feature ideation and enhancement
+SYSTEM_FEATURE_SUGGEST_PROMPT = """You are a product-minded senior engineer.
+Given the user's original task and the current correct solution module, propose ONE
+small, concrete, backward-compatible feature that adds clear user value and can be
+validated with simple tests. Keep it focused and incremental.
+
+Return only the feature description as one concise sentence. No lists, no code, no preface.
+"""
+
+SYSTEM_ENHANCE_PROMPT = """You are a senior software engineer improving an existing module.
+You will be given:
+1) The user's original task
+2) The current working module
+3) A new feature to implement (must remain backward compatible)
+
+Return a COMPLETE Python module implementing the feature while preserving existing behavior.
+- Output ONLY code, inside one Python code block, importable as 'solution'.
+- Keep public API stable (e.g., keep `solve()` if present). Avoid new external deps.
+"""
 
 ###############################################################################
 # Data structures
@@ -130,7 +160,12 @@ def make_groq_client(api_key: t.Optional[str] = None) -> Groq:
     return Groq(api_key=api_key)
 
 def list_available_models(client: Groq) -> t.List[str]:
+    """
+    Try SDK first, then raw HTTP to the /openai/v1/models endpoint.
+    Returns a list of model IDs (strings).
+    """
     api_key = os.getenv("GROQ_API_KEY")
+    # 1) SDK path
     try:
         models_obj = client.models.list()
         ids: t.List[str] = []
@@ -147,21 +182,29 @@ def list_available_models(client: Groq) -> t.List[str]:
             return sorted(set(ids))
     except Exception as e:
         print(f"[models] SDK listing failed, falling back to HTTP: {e}", file=sys.stderr)
+
+    # 2) Raw HTTP
     try:
-        import requests
         resp = requests.get(
             "https://api.groq.com/openai/v1/models",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
             timeout=15,
         )
         resp.raise_for_status()
         data = resp.json()
-        return sorted({m["id"] for m in data.get("data", []) if "id" in m})
+        ids = [m["id"] for m in data.get("data", []) if "id" in m]
+        return sorted(set(ids))
     except Exception as e:
         print(f"[models] HTTP listing failed: {e}", file=sys.stderr)
         return []
 
 def categorize_models(available: t.Iterable[str]) -> t.Tuple[t.Set[str], t.Set[str], t.Set[str]]:
+    """
+    Returns (production, preview, tool_use) present in `available`.
+    """
     avail = set(available)
     prod = {m for m in avail if m in set(PRODUCTION_MODELS)}
     prev = {m for m in avail if m in set(PREVIEW_MODELS)}
@@ -251,6 +294,32 @@ def repair_with_feedback(client: Groq, repair_model: str, failing_code: str, tas
                            user_msg, temperature=temperature, seed=seed)
     return extract_code_block(text)
 
+def suggest_new_feature(client: Groq, model: str, task_prompt: str, current_code: str,
+                        temperature: float, seed: t.Optional[int]) -> str:
+    user_msg = (
+        f"## USER TASK\n{task_prompt}\n\n"
+        f"## CURRENT SOLUTION MODULE\n```python\n{current_code}\n```\n"
+    )
+    suggestion = chat_completion(
+        client, model, SYSTEM_FEATURE_SUGGEST_PROMPT, user_msg,
+        temperature=max(0.2, min(0.7, temperature)), seed=seed
+    )
+    # Strip any accidental formatting
+    return suggestion.strip().strip('`').strip()
+
+def enhance_with_feature(client: Groq, model: str, task_prompt: str, current_code: str,
+                         feature_text: str, temperature: float, seed: t.Optional[int]) -> str:
+    user_msg = (
+        f"## USER TASK\n{task_prompt}\n\n"
+        f"## CURRENT WORKING MODULE\n```python\n{current_code}\n```\n\n"
+        f"## NEW FEATURE TO IMPLEMENT\n{feature_text}\n"
+    )
+    enhanced = chat_completion(
+        client, model, SYSTEM_ENHANCE_PROMPT, user_msg,
+        temperature=max(0.2, min(0.6, temperature)), seed=seed
+    )
+    return extract_code_block(enhanced)
+
 ###############################################################################
 # Testing sandbox
 ###############################################################################
@@ -297,7 +366,7 @@ def run_tests_on_code(solution_code: str, tests_code: str, timeout_sec: int = 25
         tmp.cleanup()
 
 ###############################################################################
-# Agent Orchestration
+# Agent Orchestration (prompt-based task; inline tests optional)
 ###############################################################################
 
 def default_tests_smoke() -> str:
@@ -337,6 +406,10 @@ def parse_cli_args(argv: t.List[str]) -> dict:
     p.add_argument("--fanout", type=int, default=3, help="How many models to fan out (when --models=auto)")
     p.add_argument("--prefer-tool-use", action="store_true",
                    help="Prefer tool-use models when task hints at tools/JSON/function-calling.")
+    p.add_argument("--disable-post-feature", action="store_true",
+                   help="Disable post-pass feature suggestion and feedback.")
+    p.add_argument("--disable-enhance", action="store_true",
+                   help="Disable enhancement attempt after suggesting a feature.")
     args = p.parse_args(argv)
     return vars(args)
 
@@ -379,8 +452,12 @@ def resolve_models(client: Groq, models_arg: str, fanout_n: int,
     available = list_available_models(client)
     if not available:
         print("[agent] Could not fetch models; using built-in defaults.", file=sys.stderr)
-        fallback_fan = ["llama-3.1-8b-instant", "mixtral-8x7b-32768", "llama-3.3-70b-versatile"][:fanout_n]
-        synth = "llama-3.3-70b-versatile"
+        fallback_fan = [
+            "deepseek-r1-distill-llama-70b",
+            "qwen/qwen3-32b",
+            "meta-llama/llama-4-maverick-17b-128e-instruct",
+        ][:fanout_n]
+        synth = "deepseek-r1-distill-llama-70b"
         return (fallback_fan, synth)
 
     prod, prev, tool = categorize_models(available)
@@ -416,15 +493,16 @@ def main(argv: t.List[str]) -> int:
     print_intermediate = args["print_intermediate"]
     fanout_n = args["fanout"]
     prefer_tool_use = args["prefer_tool_use"]
+    disable_post_feature = args["disable_post_feature"]
+    disable_enhance = args["disable_enhance"]
 
-    # === NEW: task comes from --task or stdin ===
     task_text = get_task_from_args_or_stdin(args["task"])
     tests_code = get_tests_inline_or_default(args["tests"])
 
     user_prompt = build_user_prompt(task_text)
     client = make_groq_client()
 
-    # Discover models and decide fan-out + synth
+    # Discover models and decide fan-out + synth with the updated preferences
     fanout_models, synth_model = resolve_models(
         client, models_arg, fanout_n, prefer_tool_use, task_text=task_text
     )
@@ -459,9 +537,58 @@ def main(argv: t.List[str]) -> int:
         test_result = run_tests_on_code(solution_code, tests_code, timeout_sec=timeout)
 
         if test_result.passed:
+            # Save the currently passing solution first
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write(solution_code)
-            print(f"[agent] ✅ Tests passed. Final solution saved to {out_path}", file=sys.stderr)
+            print(f"[agent] ✅ Tests passed. Solution saved to {out_path}", file=sys.stderr)
+
+            # Post-pass feature suggestion and optional enhancement
+            if not disable_post_feature:
+                try:
+                    feature = suggest_new_feature(
+                        client=client,
+                        model=synth_model,
+                        task_prompt=user_prompt,
+                        current_code=solution_code,
+                        temperature=temperature,
+                        seed=seed,
+                    )
+                    print(f"[agent] 💡 Suggested new feature: {feature}", file=sys.stderr)
+
+                    if not disable_enhance:
+                        print("[agent] Enhancing solution with suggested feature...", file=sys.stderr)
+                        enhanced_code = enhance_with_feature(
+                            client=client,
+                            model=synth_model,
+                            task_prompt=user_prompt,
+                            current_code=solution_code,
+                            feature_text=feature,
+                            temperature=temperature,
+                            seed=seed,
+                        )
+                        enhanced_result = run_tests_on_code(enhanced_code, tests_code, timeout_sec=timeout)
+                        if enhanced_result.passed:
+                            with open(out_path, "w", encoding="utf-8") as f:
+                                f.write(enhanced_code)
+                            print(f"[agent] ✅ Enhanced solution also passes. Updated {out_path}", file=sys.stderr)
+                            return 0
+                        else:
+                            # Keep original passing version, also emit enhanced attempt for review
+                            enh_fail_out = out_path.rsplit('.', 1)[0] + ".enhanced.failing.py"
+                            with open(enh_fail_out, "w", encoding="utf-8") as f:
+                                f.write(enhanced_code)
+                            print(
+                                f"[agent] ⚠️ Enhanced attempt failed tests. Kept original. Failing enhanced saved to {enh_fail_out}",
+                                file=sys.stderr,
+                            )
+                            print(enhanced_result.stdout, file=sys.stderr)
+                            print(enhanced_result.stderr, file=sys.stderr)
+                            return 0
+                except Exception as e:
+                    print(f"[agent] Post-pass feature flow encountered an error (skipping): {e}", file=sys.stderr)
+                    return 0
+
+            # No post-feature flow requested; we are done.
             return 0
 
         print("[agent] ❌ Tests failed. Feeding back errors for repair.", file=sys.stderr)
