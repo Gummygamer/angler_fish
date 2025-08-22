@@ -48,7 +48,6 @@ PREVIEW_MODELS = [
 # === Preference order updates ===
 # Fan-out now prefers: DeepSeek R1 Distill → Qwen 3 → Llama 4 Maverick → Kimi K2, then others.
 FANOUT_PREFERENCE = [
-    "deepseek-r1-distill-llama-70b",
     "qwen/qwen3-32b",
     "meta-llama/llama-4-maverick-17b-128e-instruct",
     "moonshotai/kimi-k2-instruct",
@@ -61,7 +60,6 @@ FANOUT_PREFERENCE = [
 
 # Synthesis/repair now prefers: DeepSeek R1 Distill → Qwen 3 → Llama 4 Maverick → Kimi K2, then others.
 SYNTH_PREFERENCE = [
-    "deepseek-r1-distill-llama-70b",
     "qwen/qwen3-32b",
     "meta-llama/llama-4-maverick-17b-128e-instruct",
     "moonshotai/kimi-k2-instruct",
@@ -410,6 +408,12 @@ def parse_cli_args(argv: t.List[str]) -> dict:
                    help="Disable post-pass feature suggestion and feedback.")
     p.add_argument("--disable-enhance", action="store_true",
                    help="Disable enhancement attempt after suggesting a feature.")
+    p.add_argument("--timeout-explanation", type=str, default=None,
+                   help="If tests timeout, include this human explanation of the true issue in the repair feedback.")
+    p.add_argument("--max-feature-iters", type=int, default=10,
+                   help="Maximum number of successive feature suggestion/enhancement cycles after tests first pass.")
+    p.add_argument("--enhance-repair-iters", type=int, default=2,
+                   help="Max repair iterations to try if an enhanced solution fails tests before giving up.")
     args = p.parse_args(argv)
     return vars(args)
 
@@ -495,6 +499,9 @@ def main(argv: t.List[str]) -> int:
     prefer_tool_use = args["prefer_tool_use"]
     disable_post_feature = args["disable_post_feature"]
     disable_enhance = args["disable_enhance"]
+    timeout_explanation: t.Optional[str] = args["timeout_explanation"]
+    max_feature_iters: int = max(0, int(args["max_feature_iters"]))
+    enhance_repair_iters: int = max(0, int(args["enhance_repair_iters"]))
 
     task_text = get_task_from_args_or_stdin(args["task"])
     tests_code = get_tests_inline_or_default(args["tests"])
@@ -542,51 +549,95 @@ def main(argv: t.List[str]) -> int:
                 f.write(solution_code)
             print(f"[agent] ✅ Tests passed. Solution saved to {out_path}", file=sys.stderr)
 
-            # Post-pass feature suggestion and optional enhancement
+            # Post-pass feature suggestion and optional repeated enhancement cycles
             if not disable_post_feature:
                 try:
-                    feature = suggest_new_feature(
-                        client=client,
-                        model=synth_model,
-                        task_prompt=user_prompt,
-                        current_code=solution_code,
-                        temperature=temperature,
-                        seed=seed,
-                    )
-                    print(f"[agent] 💡 Suggested new feature: {feature}", file=sys.stderr)
+                    cycles = 0
+                    current_code = solution_code
+                    while cycles < max_feature_iters:
+                        feature = suggest_new_feature(
+                            client=client,
+                            model=synth_model,
+                            task_prompt=user_prompt,
+                            current_code=current_code,
+                            temperature=temperature,
+                            seed=seed,
+                        )
+                        print(f"[agent] 💡 Suggested new feature (iter {cycles+1}/{max_feature_iters}): {feature}", file=sys.stderr)
 
-                    if not disable_enhance:
+                        if disable_enhance:
+                            break
+
                         print("[agent] Enhancing solution with suggested feature...", file=sys.stderr)
                         enhanced_code = enhance_with_feature(
                             client=client,
                             model=synth_model,
                             task_prompt=user_prompt,
-                            current_code=solution_code,
+                            current_code=current_code,
                             feature_text=feature,
                             temperature=temperature,
                             seed=seed,
                         )
                         enhanced_result = run_tests_on_code(enhanced_code, tests_code, timeout_sec=timeout)
                         if enhanced_result.passed:
+                            # Adopt enhanced code and persist
+                            current_code = enhanced_code
                             with open(out_path, "w", encoding="utf-8") as f:
-                                f.write(enhanced_code)
-                            print(f"[agent] ✅ Enhanced solution also passes. Updated {out_path}", file=sys.stderr)
-                            return 0
+                                f.write(current_code)
+                            print(f"[agent] ✅ Enhanced solution passes. Updated {out_path}", file=sys.stderr)
+                            cycles += 1
+                            # continue loop for next feature suggestion
+                            continue
                         else:
-                            # Keep original passing version, also emit enhanced attempt for review
-                            enh_fail_out = out_path.rsplit('.', 1)[0] + ".enhanced.failing.py"
-                            with open(enh_fail_out, "w", encoding="utf-8") as f:
-                                f.write(enhanced_code)
-                            print(
-                                f"[agent] ⚠️ Enhanced attempt failed tests. Kept original. Failing enhanced saved to {enh_fail_out}",
-                                file=sys.stderr,
-                            )
-                            print(enhanced_result.stdout, file=sys.stderr)
-                            print(enhanced_result.stderr, file=sys.stderr)
-                            return 0
+                            # Attempt to repair the enhanced code using the failure output
+                            print(f"[agent] ❌ Enhanced attempt failed. Trying up to {enhance_repair_iters} repair iteration(s)...", file=sys.stderr)
+                            repaired_code = enhanced_code
+                            repair_attempt = 0
+                            while repair_attempt < enhance_repair_iters:
+                                repair_attempt += 1
+                                feedback_blob = (
+                                    f"STDOUT:\n{enhanced_result.stdout}\n\nSTDERR:\n{enhanced_result.stderr}\n\n"
+                                    f"RETURNCODE: {enhanced_result.returncode}"
+                                )
+                                if (enhanced_result.returncode == 124 or "TEST TIMEOUT" in enhanced_result.stderr) and timeout_explanation:
+                                    feedback_blob += "\n\nUSER TIMEOUT EXPLANATION:\n" + timeout_explanation.strip()
+
+                                repaired_code = repair_with_feedback(
+                                    client=client,
+                                    repair_model=synth_model,
+                                    failing_code=repaired_code,
+                                    task_prompt=user_prompt,
+                                    test_output=feedback_blob,
+                                    temperature=min(0.6, temperature + 0.2),
+                                    seed=seed,
+                                )
+                                enhanced_result = run_tests_on_code(repaired_code, tests_code, timeout_sec=timeout)
+                                if enhanced_result.passed:
+                                    current_code = repaired_code
+                                    with open(out_path, "w", encoding="utf-8") as f:
+                                        f.write(current_code)
+                                    print(f"[agent] ✅ Enhanced repair succeeded on attempt {repair_attempt}. Updated {out_path}", file=sys.stderr)
+                                    cycles += 1
+                                    break
+
+                            if not enhanced_result.passed:
+                                # Keep the last passing version, write failed enhanced attempt for review
+                                enh_fail_out = out_path.rsplit('.', 1)[0] + f".enhanced.iter{cycles+1}.failing.py"
+                                with open(enh_fail_out, "w", encoding="utf-8") as f:
+                                    f.write(repaired_code)
+                                print(
+                                    f"[agent] ⚠️ Enhanced attempt (with repairs) failed on iteration {cycles+1}. Kept previous passing version. Failing enhanced saved to {enh_fail_out}",
+                                    file=sys.stderr,
+                                )
+                                print(enhanced_result.stdout, file=sys.stderr)
+                                print(enhanced_result.stderr, file=sys.stderr)
+                                break
+
+                    # Set solution_code to the latest passing code (may be unchanged)
+                    solution_code = current_code
                 except Exception as e:
                     print(f"[agent] Post-pass feature flow encountered an error (skipping): {e}", file=sys.stderr)
-                    return 0
+                    # Keep the original passing code that is already saved
 
             # No post-feature flow requested; we are done.
             return 0
@@ -596,6 +647,9 @@ def main(argv: t.List[str]) -> int:
             f"STDOUT:\n{test_result.stdout}\n\nSTDERR:\n{test_result.stderr}\n\n"
             f"RETURNCODE: {test_result.returncode}"
         )
+        # If this was a timeout and the user provided extra context, append it
+        if (test_result.returncode == 124 or "TEST TIMEOUT" in test_result.stderr) and timeout_explanation:
+            feedback_blob += "\n\nUSER TIMEOUT EXPLANATION:\n" + timeout_explanation.strip()
 
         if attempt >= max_iters:
             fail_out = out_path.rsplit(".", 1)[0] + ".failing.py"
