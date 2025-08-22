@@ -28,6 +28,8 @@ Launch the graphical interface with:
 python gui.py
 ```
 
+The GUI displays available models for selection and no longer includes the timeout explanation field.
+
 ## Development
 
 See [AGENTS.md](AGENTS.md) for contribution guidelines.
