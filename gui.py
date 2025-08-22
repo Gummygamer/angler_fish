@@ -5,7 +5,13 @@ import subprocess
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 
-from main import DEFAULT_MODELS
+from main import (
+    DEFAULT_MODELS,
+    PRODUCTION_MODELS,
+    PREVIEW_MODELS,
+    list_available_models,
+    make_groq_client,
+)
 
 # Default values matching command-line interface
 DEFAULTS = {
@@ -16,7 +22,6 @@ DEFAULTS = {
     "timeout": "25",
     "out": "solution.py",
     "fanout": "3",
-    "timeout_explanation": "",
     "max_feature_iters": "10",
     "enhance_repair_iters": "2",
 }
@@ -51,6 +56,12 @@ def start_run():
     tests = tests_text.get("1.0", tk.END).strip()
     if tests:
         cmd += ["--tests", tests]
+
+    selected = [models_listbox.get(i) for i in models_listbox.curselection()]
+    models_arg = ",".join(selected) if selected else DEFAULTS["models"]
+    if models_arg:
+        cmd += ["--models", models_arg]
+
     for key, var in entry_vars.items():
         val = var.get().strip()
         if val:
@@ -81,23 +92,36 @@ ttk.Label(root, text="Tests:").grid(row=1, column=0, sticky="nw")
 tests_text = scrolledtext.ScrolledText(root, width=60, height=5)
 tests_text.grid(row=1, column=1, columnspan=3, pady=5, padx=5)
 
+# Model selection
+try:
+    if os.getenv("GROQ_API_KEY"):
+        _client = make_groq_client()
+        AVAILABLE_MODELS = list_available_models(_client)
+    else:
+        raise RuntimeError("No API key")
+except Exception:
+    AVAILABLE_MODELS = sorted(set(PRODUCTION_MODELS + PREVIEW_MODELS))
+
+ttk.Label(root, text="Models:").grid(row=2, column=0, sticky="nw")
+models_listbox = tk.Listbox(root, selectmode=tk.MULTIPLE, height=6)
+for m in AVAILABLE_MODELS:
+    models_listbox.insert(tk.END, m)
+models_listbox.grid(row=2, column=1, columnspan=3, pady=5, padx=5, sticky="w")
+
 # Option entries
 entry_vars = {
-    "models": tk.StringVar(value=DEFAULTS["models"]),
     "temperature": tk.StringVar(value=DEFAULTS["temperature"]),
     "seed": tk.StringVar(value=DEFAULTS["seed"]),
     "max_iters": tk.StringVar(value=DEFAULTS["max_iters"]),
     "timeout": tk.StringVar(value=DEFAULTS["timeout"]),
     "out": tk.StringVar(value=DEFAULTS["out"]),
     "fanout": tk.StringVar(value=DEFAULTS["fanout"]),
-    "timeout_explanation": tk.StringVar(value=DEFAULTS["timeout_explanation"]),
     "max_feature_iters": tk.StringVar(value=DEFAULTS["max_feature_iters"]),
     "enhance_repair_iters": tk.StringVar(value=DEFAULTS["enhance_repair_iters"]),
 }
 
-row = 2
+row = 3
 for i, (label, var) in enumerate([
-    ("Models", entry_vars["models"]),
     ("Temperature", entry_vars["temperature"]),
     ("Seed", entry_vars["seed"]),
 ]):
@@ -114,7 +138,6 @@ for i, (label, var) in enumerate([
 row += 2
 for i, (label, var) in enumerate([
     ("Fanout", entry_vars["fanout"]),
-    ("Timeout Explanation", entry_vars["timeout_explanation"]),
 ]):
     ttk.Label(root, text=label + ":").grid(row=row, column=i, sticky="w", padx=5)
     ttk.Entry(root, textvariable=var, width=20).grid(row=row+1, column=i, padx=5)
