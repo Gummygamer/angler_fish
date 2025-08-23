@@ -553,19 +553,30 @@ def main(argv: t.List[str]) -> int:
         test_synth = synthesize(client, test_gens, tests_prompt, synth_model, temperature, seed, SYSTEM_TEST_SYNTH_PROMPT)
         tests_code = test_synth.code
 
-    # 1) Fan-out generation in parallel
-    print(f"[agent] Generating with {len(fanout_models)} model(s): {', '.join(fanout_models)}", file=sys.stderr)
-    gens: t.List[Generation] = asyncio.run(
-        parallel_generate(client, fanout_models, user_prompt, temperature, seed, SYSTEM_PROMPT_BASE)
-    )
-    if print_intermediate:
-        for g in gens:
-            print(f"\n--- Candidate from {g.model} (trunc) ---\n{truncate(g.code)}\n", file=sys.stderr)
+    solution_code: t.Optional[str] = None
+    if os.path.exists(out_path):
+        try:
+            with open(out_path, "r", encoding="utf-8") as f:
+                solution_code = f.read()
+            print(f"[agent] Starting from existing {out_path}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[agent] Warning: could not read {out_path}: {exc}", file=sys.stderr)
+            solution_code = None
 
-    # 2) Synthesize a single best module
-    print("[agent] Synthesizing merged solution...", file=sys.stderr)
-    synth = synthesize(client, gens, user_prompt, synth_model, temperature, seed, SYSTEM_SYNTH_PROMPT)
-    solution_code = synth.code
+    if solution_code is None:
+        # 1) Fan-out generation in parallel
+        print(f"[agent] Generating with {len(fanout_models)} model(s): {', '.join(fanout_models)}", file=sys.stderr)
+        gens: t.List[Generation] = asyncio.run(
+            parallel_generate(client, fanout_models, user_prompt, temperature, seed, SYSTEM_PROMPT_BASE)
+        )
+        if print_intermediate:
+            for g in gens:
+                print(f"\n--- Candidate from {g.model} (trunc) ---\n{truncate(g.code)}\n", file=sys.stderr)
+
+        # 2) Synthesize a single best module
+        print("[agent] Synthesizing merged solution...", file=sys.stderr)
+        synth = synthesize(client, gens, user_prompt, synth_model, temperature, seed, SYSTEM_SYNTH_PROMPT)
+        solution_code = synth.code
 
     # Attempt + repair loop
     attempt = 0

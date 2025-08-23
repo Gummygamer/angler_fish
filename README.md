@@ -20,6 +20,9 @@ python main.py --task "write fibonacci" --tests "assert solution.fib(5) == 5"
 
 Run `python main.py --help` to see all available options.
 
+If a file named `solution.py` already exists in the working directory, the agent
+uses it as the starting point instead of generating a fresh implementation.
+
 ## GUI
 
 Launch the graphical interface with:
