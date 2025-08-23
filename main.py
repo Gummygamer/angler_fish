@@ -114,6 +114,11 @@ Your job: Return a corrected, complete Python module that passes the tests.
 """
 
 CODE_BLOCK_RE = re.compile(r"```(?:python)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+def strip_think_tags(text: str) -> str:
+    """Remove model reasoning tags like <think>...</think> from text."""
+    return THINK_TAG_RE.sub("", text)
 
 # Post-pass feature ideation and enhancement
 SYSTEM_FEATURE_SUGGEST_PROMPT = """You are a product-minded senior engineer.
@@ -253,7 +258,9 @@ def auto_select_tool_use(available: t.Set[str]) -> t.Optional[str]:
 
 def extract_code_block(text: str) -> str:
     m = CODE_BLOCK_RE.search(text)
-    return (m.group(1) if m else text).strip()
+    code = m.group(1) if m else text
+    code = strip_think_tags(code)
+    return code.strip()
 
 def chat_completion(client: Groq, model: str, system: str, user: str,
                     temperature: float = 0.2, seed: t.Optional[int] = 42,
@@ -343,9 +350,9 @@ def run_tests_on_code(solution_code: str, tests_code: str, timeout_sec: int = 25
     tst_path = os.path.join(td, "tests.py")
 
     with open(sol_path, "w", encoding="utf-8") as f:
-        f.write(solution_code)
+        f.write(strip_think_tags(solution_code))
     with open(tst_path, "w", encoding="utf-8") as f:
-        f.write(tests_code)
+        f.write(strip_think_tags(tests_code))
 
     env = os.environ.copy()
     env["PYTHONPATH"] = td + os.pathsep + env.get("PYTHONPATH", "")
@@ -557,7 +564,7 @@ def main(argv: t.List[str]) -> int:
     if os.path.exists(out_path):
         try:
             with open(out_path, "r", encoding="utf-8") as f:
-                solution_code = f.read()
+                solution_code = strip_think_tags(f.read())
             print(f"[agent] Starting from existing {out_path}", file=sys.stderr)
         except Exception as exc:
             print(f"[agent] Warning: could not read {out_path}: {exc}", file=sys.stderr)
@@ -587,7 +594,7 @@ def main(argv: t.List[str]) -> int:
         if dry_run:
             print("[agent] DRY RUN: Skipping execution of generated code.", file=sys.stderr)
             with open(out_path, "w", encoding="utf-8") as f:
-                f.write(solution_code)
+                f.write(strip_think_tags(solution_code))
             print(f"[agent] Wrote solution to {out_path}", file=sys.stderr)
             return 0
 
@@ -596,7 +603,7 @@ def main(argv: t.List[str]) -> int:
         if test_result.passed:
             # Save the currently passing solution first
             with open(out_path, "w", encoding="utf-8") as f:
-                f.write(solution_code)
+                f.write(strip_think_tags(solution_code))
             print(f"[agent] ✅ Tests passed. Solution saved to {out_path}", file=sys.stderr)
 
             # Post-pass feature suggestion and optional repeated enhancement cycles
@@ -633,7 +640,7 @@ def main(argv: t.List[str]) -> int:
                             # Adopt enhanced code and persist
                             current_code = enhanced_code
                             with open(out_path, "w", encoding="utf-8") as f:
-                                f.write(current_code)
+                                f.write(strip_think_tags(current_code))
                             print(f"[agent] ✅ Enhanced solution passes. Updated {out_path}", file=sys.stderr)
                             cycles += 1
                             # continue loop for next feature suggestion
@@ -665,7 +672,7 @@ def main(argv: t.List[str]) -> int:
                                 if enhanced_result.passed:
                                     current_code = repaired_code
                                     with open(out_path, "w", encoding="utf-8") as f:
-                                        f.write(current_code)
+                                        f.write(strip_think_tags(current_code))
                                     print(f"[agent] ✅ Enhanced repair succeeded on attempt {repair_attempt}. Updated {out_path}", file=sys.stderr)
                                     cycles += 1
                                     break
@@ -674,7 +681,7 @@ def main(argv: t.List[str]) -> int:
                                 # Keep the last passing version, write failed enhanced attempt for review
                                 enh_fail_out = out_path.rsplit('.', 1)[0] + f".enhanced.iter{cycles+1}.failing.py"
                                 with open(enh_fail_out, "w", encoding="utf-8") as f:
-                                    f.write(repaired_code)
+                                    f.write(strip_think_tags(repaired_code))
                                 print(
                                     f"[agent] ⚠️ Enhanced attempt (with repairs) failed on iteration {cycles+1}. Kept previous passing version. Failing enhanced saved to {enh_fail_out}",
                                     file=sys.stderr,
@@ -704,7 +711,7 @@ def main(argv: t.List[str]) -> int:
         if attempt >= max_iters:
             fail_out = out_path.rsplit(".", 1)[0] + ".failing.py"
             with open(fail_out, "w", encoding="utf-8") as f:
-                f.write(solution_code)
+                f.write(strip_think_tags(solution_code))
             print(f"[agent] Reached max iterations. Last failing solution at {fail_out}", file=sys.stderr)
             print(test_result.stdout, file=sys.stderr)
             print(test_result.stderr, file=sys.stderr)
