@@ -408,16 +408,36 @@ def run_tests_on_code(solution_code: str, tests_code: str, timeout_sec: int = 25
 ###############################################################################
 
 def build_user_prompt(task_text: str, existing_code: t.Optional[str] = None) -> str:
-    prompt = "TASK:\n" + task_text.strip() + "\n\nDeliver a single Python module as specified."
+    """Construct the main task prompt.
+
+    When ``existing_code`` is provided, we explicitly instruct the model to
+    modify or extend the given module rather than starting from scratch. This
+    mirrors the enhancement flow used after tests pass, ensuring the baseline
+    code is part of the conversation from the very first iteration.
+    """
+
+    prompt = "TASK:\n" + task_text.strip() + "\n"
     if existing_code:
         prompt += (
-            "\n\nExisting solution module:\n```python\n"
+            "\nYou are given the current solution module below. Update or extend this "
+            "code to satisfy the TASK while preserving existing behaviour when "
+            "possible. Return the full updated module.\n"
+            "```python\n"
             + existing_code.strip()
             + "\n```"
         )
+    else:
+        prompt += "\nDeliver a single Python module as specified."
     return prompt
 
 def build_tests_prompt(task_text: str, existing_code: t.Optional[str] = None) -> str:
+    """Construct the test generation prompt.
+
+    Including the current module helps the model derive meaningful tests and,
+    when the code is present, reminds it that the implementation should be
+    updated rather than replaced with an unrelated program.
+    """
+
     prompt = (
         "TASK:\n" + task_text.strip() + "\n\n"
         "Write pytest unit tests for a module solving this task. "
@@ -425,7 +445,7 @@ def build_tests_prompt(task_text: str, existing_code: t.Optional[str] = None) ->
     )
     if existing_code:
         prompt += (
-            "\n\nExisting solution module:\n```python\n"
+            "\n\nCurrent solution module (to be updated):\n```python\n"
             + existing_code.strip()
             + "\n```"
         )
@@ -603,6 +623,9 @@ def main(argv: t.List[str]) -> int:
     attempt = 0
     while True:
         attempt += 1
+        # Refresh the user prompt with the latest solution so any subsequent
+        # repair iterations or feature suggestions see the current code.
+        user_prompt = build_user_prompt(task_text, solution_code)
         print(f"[agent] Attempt #{attempt}: testing module...", file=sys.stderr)
 
         if dry_run:
