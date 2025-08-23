@@ -343,7 +343,12 @@ def enhance_with_feature(client: Groq, model: str, task_prompt: str, current_cod
 # Testing sandbox
 ###############################################################################
 
-def run_tests_on_code(solution_code: str, tests_code: str, timeout_sec: int = 25) -> TestResult:
+def run_tests_on_code(
+    solution_code: str,
+    tests_code: str,
+    timeout_sec: int = 25,
+    run_only: bool = False,
+) -> TestResult:
     tmp = tempfile.TemporaryDirectory()
     td = tmp.name
     sol_path = os.path.join(td, "solution.py")
@@ -351,34 +356,26 @@ def run_tests_on_code(solution_code: str, tests_code: str, timeout_sec: int = 25
 
     with open(sol_path, "w", encoding="utf-8") as f:
         f.write(strip_think_tags(solution_code))
-    with open(tst_path, "w", encoding="utf-8") as f:
-        f.write(strip_think_tags(tests_code))
+    if not run_only:
+        with open(tst_path, "w", encoding="utf-8") as f:
+            f.write(strip_think_tags(tests_code))
 
     env = os.environ.copy()
     env["PYTHONPATH"] = td + os.pathsep + env.get("PYTHONPATH", "")
 
-    # First try running tests via pytest so that any test functions are actually
-    # executed.  If pytest is missing or collects no tests, fall back to running
-    # the test file directly as a script.
-    cmd_pytest = [sys.executable, "-X", "faulthandler", "-m", "pytest", tst_path]
-    cmd_script = [sys.executable, "-X", "faulthandler", tst_path]
+    if run_only:
+        cmd_run = [sys.executable, "-X", "faulthandler", sol_path]
+    else:
+        # First try running tests via pytest so that any test functions are actually
+        # executed.  If pytest is missing or collects no tests, fall back to running
+        # the test file directly as a script.
+        cmd_pytest = [sys.executable, "-X", "faulthandler", "-m", "pytest", tst_path]
+        cmd_script = [sys.executable, "-X", "faulthandler", tst_path]
 
     try:
-        proc = subprocess.run(
-            cmd_pytest,
-            cwd=td,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout_sec,
-            text=True,
-        )
-
-        # pytest exits with code 5 when no tests are collected. Also handle the
-        # case where pytest isn't installed.
-        if proc.returncode == 5 or "No module named pytest" in proc.stderr:
+        if run_only:
             proc = subprocess.run(
-                cmd_script,
+                cmd_run,
                 cwd=td,
                 env=env,
                 stdout=subprocess.PIPE,
@@ -386,6 +383,29 @@ def run_tests_on_code(solution_code: str, tests_code: str, timeout_sec: int = 25
                 timeout=timeout_sec,
                 text=True,
             )
+        else:
+            proc = subprocess.run(
+                cmd_pytest,
+                cwd=td,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout_sec,
+                text=True,
+            )
+
+            # pytest exits with code 5 when no tests are collected. Also handle the
+            # case where pytest isn't installed.
+            if proc.returncode == 5 or "No module named pytest" in proc.stderr:
+                proc = subprocess.run(
+                    cmd_script,
+                    cwd=td,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout_sec,
+                    text=True,
+                )
 
         return TestResult(
             passed=(proc.returncode == 0),
@@ -510,6 +530,38 @@ def task_wants_tool_use(task_text: str) -> bool:
     tt = task_text.lower()
     return any(h in tt for h in hints)
 
+def is_gui_or_game_task(client: Groq, models: t.List[str], task_text: str) -> bool:
+    """Determine via model majority vote if the task is a GUI app or game."""
+    system = (
+        "You are a classifier. Answer with 'yes' or 'no' only."
+    )
+    prompt = (
+        f"Task description:\n{task_text}\n\n"
+        "Is this describing a GUI application or a game?"
+    )
+    votes = 0
+    total = 0
+    for m in models:
+        try:
+            resp = chat_completion(
+                client,
+                m,
+                system,
+                prompt,
+                temperature=0.0,
+                seed=None,
+                max_output_tokens=1,
+            )
+            ans = strip_think_tags(resp).strip().lower()
+            if ans.startswith("y"):
+                votes += 1
+            total += 1
+        except Exception as exc:
+            print(f"[agent] GUI/game classification failed on {m}: {exc}", file=sys.stderr)
+    if total == 0:
+        return False
+    return votes > total / 2
+
 def resolve_models(client: Groq, models_arg: str, fanout_n: int,
                    prefer_tool_use: bool, task_text: str) -> t.Tuple[t.List[str], str]:
     if models_arg.strip().lower() != "auto":
@@ -592,7 +644,10 @@ def main(argv: t.List[str]) -> int:
         client, models_arg, fanout_n, prefer_tool_use, task_text=task_text
     )
 
-    if not tests_code:
+    classification_models = list(dict.fromkeys(fanout_models + [synth_model]))
+    gui_task = is_gui_or_game_task(client, classification_models, task_text)
+
+    if not tests_code and not gui_task:
         print(f"[agent] Generating tests with {len(fanout_models)} model(s): {', '.join(fanout_models)}", file=sys.stderr)
         test_gens: t.List[Generation] = asyncio.run(
             parallel_generate(client, fanout_models, tests_prompt, temperature, seed, SYSTEM_TEST_PROMPT)
@@ -603,6 +658,8 @@ def main(argv: t.List[str]) -> int:
         print("[agent] Synthesizing merged tests...", file=sys.stderr)
         test_synth = synthesize(client, test_gens, tests_prompt, synth_model, temperature, seed, SYSTEM_TEST_SYNTH_PROMPT)
         tests_code = test_synth.code
+
+    tests_code = tests_code or ""
 
     if solution_code is None:
         # 1) Fan-out generation in parallel
@@ -635,7 +692,7 @@ def main(argv: t.List[str]) -> int:
             print(f"[agent] Wrote solution to {out_path}", file=sys.stderr)
             return 0
 
-        test_result = run_tests_on_code(solution_code, tests_code, timeout_sec=timeout)
+        test_result = run_tests_on_code(solution_code, tests_code, timeout_sec=timeout, run_only=gui_task)
 
         if test_result.passed:
             # Save the currently passing solution first
@@ -672,7 +729,12 @@ def main(argv: t.List[str]) -> int:
                             temperature=temperature,
                             seed=seed,
                         )
-                        enhanced_result = run_tests_on_code(enhanced_code, tests_code, timeout_sec=timeout)
+                        enhanced_result = run_tests_on_code(
+                            enhanced_code,
+                            tests_code,
+                            timeout_sec=timeout,
+                            run_only=gui_task,
+                        )
                         if enhanced_result.passed:
                             # Adopt enhanced code and persist
                             current_code = enhanced_code
@@ -705,7 +767,12 @@ def main(argv: t.List[str]) -> int:
                                     temperature=min(0.6, temperature + 0.2),
                                     seed=seed,
                                 )
-                                enhanced_result = run_tests_on_code(repaired_code, tests_code, timeout_sec=timeout)
+                                enhanced_result = run_tests_on_code(
+                                    repaired_code,
+                                    tests_code,
+                                    timeout_sec=timeout,
+                                    run_only=gui_task,
+                                )
                                 if enhanced_result.passed:
                                     current_code = repaired_code
                                     with open(out_path, "w", encoding="utf-8") as f:

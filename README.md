@@ -28,6 +28,14 @@ current contents of `solution.py` are included in prompts and the models are
 explicitly instructed to update or extend this code, rather than replacing it
 with an unrelated program.
 
+### GUI / Game Tasks
+
+When your task describes a GUI application or a game, Angler Fish skips unit
+test generation and simply runs the produced module to ensure it executes
+without raising an error. The agent determines whether a task is GUI or game
+related by asking each selected model and treating it as such only if a strict
+majority votes "yes".
+
 ## GUI
 
 Launch the graphical interface with:
