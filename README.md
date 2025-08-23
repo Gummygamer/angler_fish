@@ -2,6 +2,8 @@
 
 Angler Fish is a Python agent that uses Groq's language models to generate, test, and iteratively refine code. It offers a command-line interface and a simple Tkinter-based GUI.
 
+The agent strips any `<think>` reasoning blocks from generated code and tests before executing them.
+
 ## Installation
 
 The project targets Python 3. Install required dependencies:
