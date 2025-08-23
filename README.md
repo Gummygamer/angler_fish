@@ -23,7 +23,9 @@ python main.py --task "write fibonacci" --tests "assert solution.fib(5) == 5"
 Run `python main.py --help` to see all available options.
 
 If a file named `solution.py` already exists in the working directory, the agent
-uses it as the starting point instead of generating a fresh implementation.
+uses it as the starting point instead of generating a fresh implementation. The
+current contents of `solution.py` are included in prompts to the models so they
+can build on or repair the existing solution.
 
 ## GUI
 

@@ -407,15 +407,29 @@ def run_tests_on_code(solution_code: str, tests_code: str, timeout_sec: int = 25
 # Agent Orchestration (prompt-based task; inline tests optional)
 ###############################################################################
 
-def build_user_prompt(task_text: str) -> str:
-    return "TASK:\n" + task_text.strip() + "\n\nDeliver a single Python module as specified."
+def build_user_prompt(task_text: str, existing_code: t.Optional[str] = None) -> str:
+    prompt = "TASK:\n" + task_text.strip() + "\n\nDeliver a single Python module as specified."
+    if existing_code:
+        prompt += (
+            "\n\nExisting solution module:\n```python\n"
+            + existing_code.strip()
+            + "\n```"
+        )
+    return prompt
 
-def build_tests_prompt(task_text: str) -> str:
-    return (
+def build_tests_prompt(task_text: str, existing_code: t.Optional[str] = None) -> str:
+    prompt = (
         "TASK:\n" + task_text.strip() + "\n\n"
         "Write pytest unit tests for a module solving this task. "
         "Import the solution module as 'solution'."
     )
+    if existing_code:
+        prompt += (
+            "\n\nExisting solution module:\n```python\n"
+            + existing_code.strip()
+            + "\n```"
+        )
+    return prompt
 
 def parse_cli_args(argv: t.List[str]) -> dict:
     import argparse
@@ -539,8 +553,18 @@ def main(argv: t.List[str]) -> int:
     task_text = get_task_from_args_or_stdin(args["task"])
     tests_code = get_tests_inline_or_default(args["tests"])
 
-    user_prompt = build_user_prompt(task_text)
-    tests_prompt = build_tests_prompt(task_text)
+    solution_code: t.Optional[str] = None
+    if os.path.exists(out_path):
+        try:
+            with open(out_path, "r", encoding="utf-8") as f:
+                solution_code = strip_think_tags(f.read())
+            print(f"[agent] Starting from existing {out_path}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[agent] Warning: could not read {out_path}: {exc}", file=sys.stderr)
+            solution_code = None
+
+    user_prompt = build_user_prompt(task_text, solution_code)
+    tests_prompt = build_tests_prompt(task_text, solution_code)
     client = make_groq_client()
 
     # Discover models and decide fan-out + synth with the updated preferences
@@ -559,16 +583,6 @@ def main(argv: t.List[str]) -> int:
         print("[agent] Synthesizing merged tests...", file=sys.stderr)
         test_synth = synthesize(client, test_gens, tests_prompt, synth_model, temperature, seed, SYSTEM_TEST_SYNTH_PROMPT)
         tests_code = test_synth.code
-
-    solution_code: t.Optional[str] = None
-    if os.path.exists(out_path):
-        try:
-            with open(out_path, "r", encoding="utf-8") as f:
-                solution_code = strip_think_tags(f.read())
-            print(f"[agent] Starting from existing {out_path}", file=sys.stderr)
-        except Exception as exc:
-            print(f"[agent] Warning: could not read {out_path}: {exc}", file=sys.stderr)
-            solution_code = None
 
     if solution_code is None:
         # 1) Fan-out generation in parallel
